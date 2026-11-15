@@ -1,7 +1,7 @@
 # STATUS — live-solvent-assess
 
 ## Now
-- PASS | Initial public carve-out from TURI DoSS / P2OASys stack
+- PASS | Initial public carve-out from TURI DoSS / hazard-score stack
 
 ## Builds (code)
 - Initial export pushed to https://github.com/glsalierno/live-solvent-assess
