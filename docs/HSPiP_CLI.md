@@ -6,7 +6,7 @@
 2. Ensure your license includes **CLI** (Command Line Interface). Contact HSPiP support if unsure.
 3. Set `HSPIP_PATH` to the install folder (example: `C:\Program Files\Hansen-Solubility\HSPiP` or `...\Hansen-Solubility-6\HSPiP`), or `HSPIP_EXE` to `HSPiP.exe` itself.
 
-**TURI Safe Chem DB never ships `HSPiP.exe`.** You must install it yourself.
+**This repository never ships `HSPiP.exe`.** You must install it yourself.
 
 ## In-app path prompt (DoSS Streamlit)
 
