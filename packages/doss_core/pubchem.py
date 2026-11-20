@@ -6,88 +6,169 @@ Retrieves identity, physicochemical properties, and hazard information.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from threading import Lock
+from urllib.parse import quote
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from packages.doss_core.logging_support import cas_context, get_logger
+
+logger = get_logger(__name__)
+
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 PUBCHEM_VIEW_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view"
 PUBCHEM_COMPOUND_URL = "https://pubchem.ncbi.nlm.nih.gov/compound"
 
-REQUEST_TIMEOUT = 45
+REQUEST_TIMEOUT = (5.0, 30.0)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_MIN_INTERVAL = 0.35
+_MAX_RETRY_WAIT = 20
+_CACHE_TTL = 3600
+_CACHE_MAX_ENTRIES = 128
+_request_lock = Lock()
+_cache_lock = Lock()
+_next_request_at = 0.0
+_cooldown_until = 0.0
+_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 
 
 class PubChemError(Exception):
-    """Raised when PubChem API returns an error or compound not found."""
-
-    pass
+    """Raised when PubChem cannot supply the requested data."""
 
 
-def _get_with_retries(
-    url: str,
-    *,
-    label: str,
-    attempts: int = 4,
-    base_delay: float = 1.5,
-) -> requests.Response:
-    """GET with backoff on transient PubChem errors (ServerBusy / 503 / 429)."""
-    last_exc: Exception | None = None
-    for i in range(attempts):
+class PubChemThrottledError(PubChemError):
+    """PubChem is throttling requests or asks the client to pause."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _PubChemNotFoundError(PubChemError):
+    """PubChem returned HTTP 404."""
+
+
+def _throttle() -> None:
+    global _next_request_at
+    with _request_lock:
+        now = time.monotonic()
+        if now < _cooldown_until:
+            raise PubChemThrottledError("PubChem requested a cooldown.", _cooldown_until - now)
+        wait = _next_request_at - now
+        if wait > 0:
+            time.sleep(wait)
+        _next_request_at = time.monotonic() + _MIN_INTERVAL
+
+
+def _retry_after(response: requests.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    if value.isascii() and value.isdigit() and len(value) < 20:
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+        if not when or when.tzinfo is None:
+            return None
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _cached_response(url: str) -> requests.Response | None:
+    with _cache_lock:
+        item = _cache.get(url)
+        if item is None:
+            return None
+        expires_at, content = item
+        if time.monotonic() >= expires_at:
+            del _cache[url]
+            return None
+        _cache.move_to_end(url)
+    response = requests.Response()
+    response.status_code = 200
+    response.url = url
+    response.encoding = "utf-8"
+    response._content = content
+    response.headers["X-Cache"] = "HIT"
+    return response
+
+
+def _cache_success(url: str, response: requests.Response) -> None:
+    try:
+        if not isinstance(response.json(), dict):
+            return
+    except ValueError as exc:
+        logger.debug("pubchem_cache_skip_non_json error_type=%s", type(exc).__name__)
+        return
+    with _cache_lock:
+        _cache[url] = (time.monotonic() + _CACHE_TTL, response.content)
+        _cache.move_to_end(url)
+        if len(_cache) > _CACHE_MAX_ENTRIES:
+            _cache.popitem(last=False)
+
+
+def _get_with_retries(url: str, *, label: str, attempts: int = 4) -> requests.Response:
+    """Fetch with a process-wide request pace, success cache, and bounded retry."""
+    global _cooldown_until
+    cached = _cached_response(url)
+    if cached is not None:
+        return cached
+
+    for attempt in range(attempts):
+        _throttle()
+        retry_after = None
         try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code in RETRYABLE_STATUS:
-                last_exc = requests.HTTPError(
-                    f"{resp.status_code} Server Error for url: {url}",
-                    response=resp,
-                )
-                # honor Retry-After when present
-                delay = base_delay * (2**i)
-                ra = resp.headers.get("Retry-After")
-                if ra:
-                    try:
-                        delay = max(delay, float(ra))
-                    except ValueError:
-                        pass
-                if i + 1 < attempts:
-                    time.sleep(min(delay, 20.0))
-                    continue
-                resp.raise_for_status()
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as e:
-            last_exc = e
-            if i + 1 < attempts:
-                time.sleep(min(base_delay * (2**i), 20.0))
-                continue
-            break
-    raise PubChemError(f"{label}: {last_exc}")
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt + 1 == attempts:
+                logger.warning("pubchem_transport_failed context=%r error_type=%s", label, type(exc).__name__)
+                raise PubChemError(f"{label}: PubChem network request failed.") from exc
+        except requests.RequestException as exc:
+            raise PubChemError(f"{label}: PubChem request failed.") from exc
+        else:
+            status = response.status_code
+            if status == 404:
+                raise _PubChemNotFoundError(f"{label}: PubChem record not found.")
+            if status == 200:
+                _cache_success(url, response)
+                return response
+            if status not in RETRYABLE_STATUS:
+                raise PubChemError(f"{label}: PubChem returned HTTP {status}.")
+            retry_after = _retry_after(response)
+            throttled = status in {429, 503}
+            logger.debug("pubchem_retryable_response context=%r status=%d attempt=%d", label, status, attempt + 1)
+            if throttled and (attempt + 1 == attempts or (retry_after or 0) > _MAX_RETRY_WAIT):
+                if retry_after:
+                    with _request_lock:
+                        _cooldown_until = max(_cooldown_until, time.monotonic() + retry_after)
+                logger.warning("pubchem_throttled context=%r status=%d attempts=%d", label, status, attempt + 1)
+                raise PubChemThrottledError(f"{label}: PubChem is temporarily throttled.", retry_after)
+            if attempt + 1 == attempts or (retry_after or 0) > _MAX_RETRY_WAIT:
+                raise PubChemError(f"{label}: PubChem returned HTTP {status}.")
+        delay = min(_MAX_RETRY_WAIT, 1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+        wait = max(delay, retry_after or 0)
+        time.sleep(wait)
+
+    raise PubChemError(f"{label}: PubChem request did not complete.")
 
 
 def get_cid_by_cas(cas: str) -> Optional[int]:
     """Look up PubChem CID by CAS registry number."""
-    url = f"{PUBCHEM_BASE}/compound/name/{cas}/cids/JSON"
-    last_exc: Exception | None = None
-    for i in range(4):
-        try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 404:
-                return None
-            if resp.status_code in RETRYABLE_STATUS:
-                last_exc = requests.HTTPError(
-                    f"{resp.status_code} for url: {url}", response=resp
-                )
-                time.sleep(min(1.5 * (2**i), 20.0))
-                continue
-            resp.raise_for_status()
-            cids = resp.json().get("IdentifierList", {}).get("CID", [])
-            return cids[0] if cids else None
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(min(1.5 * (2**i), 20.0))
-    raise PubChemError(f"Failed to lookup CAS {cas}: {last_exc}")
+    url = f"{PUBCHEM_BASE}/compound/name/{quote(cas, safe='')}/cids/JSON"
+    try:
+        response = _get_with_retries(url, label=f"CID lookup for CAS {cas_context(cas)}")
+    except _PubChemNotFoundError:
+        return None
+    cids = response.json().get("IdentifierList", {}).get("CID", [])
+    return cids[0] if cids else None
 
 
 def get_compound_properties(cid: int) -> Dict[str, Any]:
@@ -138,7 +219,6 @@ def get_compound_view_data(cid: int) -> Dict[str, Any]:
         url,
         label=f"Failed to fetch view data for CID {cid}",
         attempts=5,
-        base_delay=2.0,
     )
     return resp.json()
 
@@ -193,7 +273,8 @@ def extract_experimental_properties(view_data: Dict[str, Any]) -> Dict[str, Any]
                                 nfpa = _extract_nfpa(hazard_sec)
                                 result.update(nfpa)
 
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.debug("pubchem_view_parse_failed error_type=%s", type(exc).__name__)
         pass
 
     return result
@@ -329,15 +410,20 @@ def fetch_compound_data(cas: str, name_hint: Optional[str] = None) -> Dict[str, 
         raise PubChemError(f"Compound not found for CAS {cas}")
 
     basic_props = get_compound_properties(cid)
-    time.sleep(0.25)
 
     exp_props: Dict[str, Any] = {}
     view_warning: Optional[str] = None
     try:
         view_data = get_compound_view_data(cid)
         exp_props = extract_experimental_properties(view_data)
-    except PubChemError as e:
-        view_warning = str(e)
+    except PubChemThrottledError:
+        view_warning = (
+            "PubChem is rate-limiting extended data. Identity is available, but experimental and "
+            "hazard fields from PubChem may be missing. Retry later."
+        )
+    except PubChemError as exc:
+        logger.warning("pubchem_view_unavailable cas=%s error_type=%s", cas_context(cas), type(exc).__name__)
+        view_warning = "PubChem extended data unavailable. The result uses the available identity data."
 
     name = name_hint or basic_props.get("Title") or basic_props.get("IUPACName", "")
 
