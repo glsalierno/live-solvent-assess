@@ -48,6 +48,6 @@ See `docs/INSTALL.md` and `docs/HSPiP_CLI.md`.
 
 ## License & collaboration
 
-MIT for this repository's code — see [LICENSE](LICENSE). HSPiP software, CLI licenses, and `.sofx` data libraries are NOT covered by this MIT license. Obtain them separately from Hansen Solubility / HSPiP. See [NOTICE.md](NOTICE.md). PubChem and supplier SDS sites have their own terms.
+MIT for this repository's code — see [LICENSE](LICENSE). HSPiP software, CLI licenses, and `.sofx` data libraries are NOT covered by this MIT license. Obtain them separately from Hansen Solubility / HSPiP. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). PubChem and supplier SDS sites have their own terms.
 
 Built at TURI / UMass Lowell. Collaboration inquiries via the maintainer's GitHub profile.
