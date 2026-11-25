@@ -13,6 +13,12 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+from packages.doss_core.logging_support import cas_context, get_logger
+from packages.doss_core.system_diagnostics import (
+    active_overrides,
+    bundled_database,
+    dependency_versions,
+)
 from packages.doss_core.schema import (
     DOSS_COLUMNS,
     EMPTY_VALUE,
@@ -30,6 +36,7 @@ from packages.p2oasys_core.lookup import (
 )
 from packages.doss_core.pubchem import (
     PubChemError,
+    PubChemThrottledError,
     fetch_compound_data,
     get_smiles_for_cas,
     parse_numeric_with_unit,
@@ -49,6 +56,8 @@ from packages.doss_core.hspip import (
     save_hspip_paths,
 )
 from packages.doss_core.glove_hsp import format_glove_hsp_flag
+
+logger = get_logger(__name__)
 
 st.set_page_config(
     page_title="Live Solvent Assess - DoSS",
@@ -261,6 +270,8 @@ def build_doss_row(
     props = pubchem_data.get("properties", {})
 
     row["CAS"] = cas
+    if pubchem_data.get("view_warning"):
+        notes.append(pubchem_data["view_warning"])
     row["Solvent Name"] = pubchem_data.get("name", EMPTY_VALUE)
     row["Formula"] = pubchem_data.get("formula", EMPTY_VALUE)
 
@@ -442,7 +453,9 @@ def build_doss_row(
             elif tci.get("product_number"):
                 notes.append(f"TCI product {tci['product_number']}")
         except Exception as exc:
-            notes.append(f"TCI enrich skipped: {exc}")
+            logger.warning("vendor_enrichment_skipped vendor=TCI cas=%s error_type=%s",
+                           cas_context(cas), type(exc).__name__)
+            notes.append("TCI enrichment unavailable")
 
 
     # --- On-demand Fisher SDS (prefer over PubChem/TCI for NFPA + cost + SDS + §9 when present) ---
@@ -502,7 +515,9 @@ def build_doss_row(
             elif fisher.get("part_number"):
                 notes.append(f"Fisher part {fisher['part_number']}")
         except Exception as exc:
-            notes.append(f"Fisher enrich skipped: {exc}")
+            logger.warning("vendor_enrichment_skipped vendor=Fisher cas=%s error_type=%s",
+                           cas_context(cas), type(exc).__name__)
+            notes.append("Fisher enrichment unavailable")
 
     # --- Precautionary NFPA merge (higher rating wins; cite all sources on disagreement) ---
     h_val, h_note = _precautionary_nfpa(nfpa_health_cands)
@@ -557,8 +572,8 @@ def build_doss_row(
                 molar_vol = (mw_float / d_float) * 1000
                 row["Molar Volume"] = _fmt_num(molar_vol, 1)
                 prop_sources["Molar Volume"] = "calculated"
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as exc:
+            logger.warning("molar_volume_skipped cas=%s error_type=%s", cas_context(cas), type(exc).__name__)
 
     # --- P2OASys (expert CSV → SQLite expert → SQLite auto) ---
     p2 = resolve_p2oasys(cas, expert_df)
@@ -685,6 +700,29 @@ def render_coverage_sidebar(row: Dict[str, Any]):
         )
 
 
+def render_system_diagnostics() -> None:
+    with st.sidebar.expander("System Diagnostics", expanded=False):
+        st.markdown("**Runtime versions**")
+        st.json(dependency_versions("live-solvent-assess", "0.1.0"), expanded=False)
+        db = bundled_database()
+        st.markdown("**Bundled score SQLite**")
+        st.caption(f"Status: {db['status']}")
+        if "rows" in db:
+            st.caption(f"Rows: {db['rows']:,}")
+        st.markdown("**Active overrides**")
+        names = active_overrides((
+            "DOSS_ENABLE_FISHER",
+            "EXPERT_P2OASYS_CSV",
+            "P2OASYS_SCORE_LOOKUP_DB",
+            "HSPIP_EXE",
+            "HSPIP_PATH",
+            "HSPIP_DATA",
+            "HSPIP_DATA_DIR",
+            "LOG_LEVEL",
+        ))
+        st.caption(", ".join(names) if names else "None")
+
+
 def main():
     st.title("🧪 Live Solvent Assess")
     st.markdown(
@@ -695,6 +733,7 @@ def main():
     expert_df = load_expert_csv()
 
     st.sidebar.markdown("## Settings")
+    render_system_diagnostics()
 
     uploaded_file = st.sidebar.file_uploader(
         "Upload P2OASys Expert CSV",
@@ -773,6 +812,8 @@ def main():
                         cas_input.strip(),
                         name_hint=name_input.strip() if name_input else None,
                     )
+                    if pubchem_data.get("view_warning"):
+                        st.warning(pubchem_data["view_warning"])
                     row = build_doss_row(
                         pubchem_data,
                         expert_df,
@@ -792,6 +833,8 @@ def main():
                         row = apply_cli_hsp_to_row(row, result)
                     st.session_state["current_row"] = row
                     st.session_state["current_rows"] = [row]
+                except PubChemThrottledError:
+                    st.warning("PubChem is rate-limiting requests. Try again in a few minutes.")
                 except PubChemError as e:
                     st.error(f"PubChem lookup failed: {e}")
                 except Exception as e:
@@ -858,6 +901,8 @@ def main():
 
                     try:
                         pubchem_data = fetch_compound_data(cas)
+                        if pubchem_data.get("view_warning"):
+                            errors.append(f"{cas}: {pubchem_data['view_warning']}")
                         row = build_doss_row(
                             pubchem_data,
                             expert_df,
@@ -865,6 +910,13 @@ def main():
                             enable_fisher=enable_fisher,
                         )
                         rows.append(row)
+                    except PubChemThrottledError:
+                        errors.append(f"{cas}: PubChem rate limit")
+                        empty = empty_row()
+                        empty["CAS"] = cas
+                        rows.append(empty)
+                        st.warning("PubChem is rate-limiting requests. Batch stopped; remaining CAS were not queried.")
+                        break
                     except Exception as e:
                         errors.append(f"{cas}: {e}")
                         empty = empty_row()
