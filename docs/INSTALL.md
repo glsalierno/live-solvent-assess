@@ -10,7 +10,7 @@
 ## Steps
 
 ```bash
-cd turi-safe-chem-db
+cd live-solvent-assess
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -r requirements.txt
@@ -21,7 +21,7 @@ pip install -e .
 Without editable install, set `PYTHONPATH` to the repo root:
 
 ```bat
-set PYTHONPATH=C:\path\to\turi-safe-chem-db
+set "PYTHONPATH=<path-to-live-solvent-assess>"
 ```
 
 ## Run
